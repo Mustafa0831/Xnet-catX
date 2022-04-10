@@ -1,154 +1,72 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
-	"time"
+	"sync"
+	"strconv"
 )
 
-type User struct {
-	Name   string
-	Output chan Message
-}
-
-type Message struct {
-	Username string
-	Text     string
-}
-
-type ChatServer struct {
-	Users map[string]User
-	Join  chan User
-	Leave chan User
-	Input chan Message
-}
-
-func CheckMsg(s string) bool {
-	for _, e := range s {
-		if e != ' ' && e != '\t' && e != '\n' {
-			return true
-		}
-	}
-	return false
-}
-
-func (cs *ChatServer) Run() {
-	for {
-		select {
-		case user := <-cs.Join:
-			cs.Users[user.Name] = user
-			go func() {
-				cs.Input <- Message{
-					Username: user.Name,
-					Text:     fmt.Sprint("has joined our chat..."),
-				}
-			}()
-		case user := <-cs.Leave:
-			delete(cs.Users, user.Name)
-			go func() {
-				cs.Input <- Message{
-					Username: user.Name,
-					Text:     fmt.Sprintf("has left our chat..."),
-				}
-			}()
-		case msg := <-cs.Input:
-			for _, user := range cs.Users {
-				select {
-				case user.Output <- msg:
-				default:
-				}
-			}
-		}
-	}
-}
-
-func handleConn(chatServer *ChatServer, conn net.Conn) {
-	defer conn.Close()
-	io.WriteString(conn, "Welcome to TCP-Chat!\n")
-
-	b, Perr := ioutil.ReadFile("pingvi.txt")
-	// can file be opened?
-	if Perr != nil {
-		fmt.Print(Perr)
-		os.Exit(0)
-	}
-
-	// convert bytes to string
-	myStr := string(b)
-	io.WriteString(conn, myStr+"\n")
-	io.WriteString(conn, "[ENTER YOUR NAME]: ")
-
-	scanner := bufio.NewScanner(conn)
-	scanner.Scan()
-	user := User{
-		Name:   scanner.Text(),
-		Output: make(chan Message, 10),
-	}
-	chatServer.Join <- user
-	defer func() {
-		chatServer.Leave <- user
-	}()
-
-	// Read from conn
-	go func() {
-		for scanner.Scan() {
-
-			ln := scanner.Text()
-			chatServer.Input <- Message{user.Name, ln}
-		}
-	}()
-
-	// write to conn
-	for msg := range user.Output {
-		// if msg.Username != user.Name {
-		if CheckMsg(msg.Text) {
-			currentTime := time.Now()
-			if msg.Text == "has joined our chat..." {
-				_, err := io.WriteString(conn, msg.Username+" "+msg.Text+"\n")
-				if err != nil {
-					break
-				}
-			} else if msg.Text == "has left our chat..." {
-				_, err := io.WriteString(conn, msg.Username+" "+msg.Text+"\n")
-				if err != nil {
-					break
-				}
-			} else {
-				_, err := io.WriteString(conn, "["+currentTime.Format("2006-01-02 15:04:05")+"]"+"["+msg.Username+"]"+": "+msg.Text+"\n")
-				if err != nil {
-					break
-				}
-			}
-		}
-		// }
-	}
-}
+// to save logs in files, run:
+// go run ./ >>logs/info.log 2>>logs/err.log
+var infoLog = log.New(os.Stdout, "INFO\t", log.Ldate|log.Ltime)
+var errLog = log.New(os.Stderr, "ERROR\t", log.Ldate|log.Ltime|log.Lshortfile)
 
 func main() {
-	server, err := net.Listen("tcp", ":8989")
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-	defer server.Close()
+	s := NewServer()
+	ch := NewChat()
 
-	chatServer := &ChatServer{
-		Users: make(map[string]User),
-		Join:  make(chan User),
-		Leave: make(chan User),
-		Input: make(chan Message),
+	// Clear chat history
+	if err := os.Truncate("files/temp.txt", 0); err != nil {
+		errLog.Fatalf("Failed to truncate: %v", err)
 	}
-	go chatServer.Run()
 
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatalln(err.Error())
+	// Running incoming commands from users
+	go s.runCommands(ch)
+
+	var port string
+	switch len(os.Args) {
+	case 1:
+		port = ":8989"
+	case 2:
+		if _, err := strconv.Atoi(os.Args[1]); err != nil {
+			fmt.Println("[USAGE]: ./TCPChat $port")
+			return
 		}
-		go handleConn(chatServer, conn)
+		port = ":" + os.Args[1]
+	default:
+		fmt.Println("[USAGE]: ./TCPChat $port")
+		return
+	}
+
+	// Running TCP server
+	listener, err := net.Listen("tcp", port)
+	if err != nil {
+		errLog.Fatalf("unable to start server %s\n", err.Error())
+	}
+
+	defer listener.Close()
+	infoLog.Printf("listening on the port: %s\n", port)
+
+	// Listening connections to the server
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			errLog.Printf("unable to accept connection %s\n", err.Error())
+			continue
+		}
+
+		if len(ch.members) == 10 {
+			fmt.Fprintln(conn, "max num of connections is 10. try later")
+			conn.Close()
+			continue
+		}
+
+		var mutex sync.Mutex
+
+		// Creating new client
+		go s.NewClient(conn, ch, &mutex)
 	}
 }
